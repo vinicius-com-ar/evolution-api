@@ -33,6 +33,101 @@ import mimeTypes from 'mime-types';
 import path from 'path';
 import { Readable } from 'stream';
 
+
+// === Toggle via .env (default: ON) ===
+const PRE_DOWNLOAD_ATTACHMENTS =
+  (process.env.CHATWOOT_PRE_DOWNLOAD_ATTACHMENTS ?? 'true').toLowerCase() !== 'false';
+
+// === Helpers para baixar anexos de ActiveStorage com retry e re-resolve ===
+const sleep = (ms: number) => new Promise((res) => setTimeout(res, ms));
+
+const isActiveStorageRedirect = (url: string) =>
+  /\/rails\/active_storage\/blobs\/redirect\//.test(url);
+
+/**
+ * Resolve uma URL do ActiveStorage para a URL final (S3) sem seguir redirect automaticamente.
+ */
+async function resolveActiveStorageOnce(url: string, headers?: Record<string, string>) {
+  const res = await axios
+    .get(url, {
+      maxRedirects: 0,
+      validateStatus: (s) => (s >= 200 && s < 300) || s === 301 || s === 302,
+      headers,
+    })
+    .catch((err) => err?.response);
+
+  if (!res) throw new Error('ActiveStorage resolve failed: no response');
+
+  const loc = res.headers?.location;
+  if (loc) return loc;
+
+  if (res.status >= 200 && res.status < 300) return url;
+
+  throw new Error(`ActiveStorage resolve failed with status ${res.status}`);
+}
+
+/**
+ * Baixa um arquivo com tolerância:
+ * - Se a URL é ActiveStorage, re-resolve a cada tentativa para pegar a S3 atual
+ * - Retry exponencial para 404/403/5xx/erros de rede
+ */
+async function downloadWithActiveStorageRetry(
+  url: string,
+  opts?: { maxAttempts?: number; baseDelayMs?: number; headers?: Record<string, string> }
+): Promise<{ buffer: Buffer; mime: string; filename?: string }> {
+  const maxAttempts = opts?.maxAttempts ?? 4;
+  const baseDelayMs = opts?.baseDelayMs ?? 600;
+  let finalUrl = url;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      if (isActiveStorageRedirect(finalUrl)) {
+        finalUrl = await resolveActiveStorageOnce(finalUrl, opts?.headers);
+      }
+
+      const res = await axios.get(finalUrl, {
+        responseType: 'arraybuffer',
+        timeout: 60000,
+        headers: opts?.headers,
+        maxContentLength: Infinity,
+        maxBodyLength: Infinity,
+      });
+
+      if (!(res.status >= 200 && res.status < 300)) {
+        throw new Error(`Download failed with status ${res.status}`);
+      }
+
+      const mime = res.headers['content-type'] || 'application/octet-stream';
+
+      // tenta extrair filename do content-disposition
+      let filename: string | undefined;
+      const cd = res.headers['content-disposition'];
+      if (cd) {
+        const m = /filename\*?=(?:UTF-8''|")?([^";\n]+)/i.exec(cd);
+        if (m?.[1]) filename = decodeURIComponent(m[1].replace(/"/g, ''));
+      }
+
+      return { buffer: Buffer.from(res.data), mime, filename };
+    } catch (e: any) {
+      const status = e?.response?.status;
+      const retryable = e?.response
+        ? [404, 403, 408, 429, 500, 502, 503, 504].includes(status)
+        : true; // erros de rede/DNS/timeouts
+
+      if (attempt >= maxAttempts || !retryable) {
+        throw e;
+      }
+
+      // URL presignada pode ter expirado → re-resolve de novo na próxima
+      finalUrl = url;
+      await sleep(baseDelayMs * Math.pow(2, attempt - 1));
+    }
+  }
+
+  throw new Error('Unreachable');
+}
+
+
 interface ChatwootMessage {
   messageId?: number;
   inboxId?: number;
@@ -1121,81 +1216,100 @@ export class ChatwootService {
     }
   }
 
-  public async sendAttachment(waInstance: any, number: string, media: any, caption?: string, options?: Options) {
-    try {
-      const parsedMedia = path.parse(decodeURIComponent(media));
-      let mimeType = mimeTypes.lookup(parsedMedia?.ext) || '';
-      let fileName = parsedMedia?.name + parsedMedia?.ext;
+public async sendAttachment(
+  waInstance: any,
+  number: string,
+  media: any,
+  caption?: string,
+  options?: Options
+) {
+  try {
+    const parsedMedia = path.parse(decodeURIComponent(media));
+    let mimeType = mimeTypes.lookup(parsedMedia?.ext) || '';
+    let fileName = parsedMedia?.name ? (parsedMedia.name + (parsedMedia.ext || '')) : '';
 
+    // Se o toggle estiver LIGADO, tentamos baixar e enviar em base64 (robusto para URLs que expiram).
+    // Se desligado, preserva o fluxo antigo (URL direta).
+    let downloaded:
+      | { buffer: Buffer; mime: string; filename?: string }
+      | null = null;
+
+    if (PRE_DOWNLOAD_ATTACHMENTS) {
+      try {
+        downloaded = await downloadWithActiveStorageRetry(media /*, { headers: { /* se precisar auth *\/ } */);
+        if (!mimeType) mimeType = downloaded.mime;
+        if (!fileName && downloaded.filename) fileName = downloaded.filename;
+      } catch (e) {
+        // Fallback: se o download falhar, tenta seguir com a URL original
+        this.logger.warn(
+          `[sendAttachment] falling back to remote URL (download failed): ${String(e)}`
+        );
+      }
+    } else {
+      // Mantém comportamento antigo; se não souber mimeType, tenta obter
       if (!mimeType) {
-        const parts = media.split('/');
-        fileName = decodeURIComponent(parts[parts.length - 1]);
-
-        const response = await axios.get(media, {
-          responseType: 'arraybuffer',
-        });
-        mimeType = response.headers['content-type'];
+        try {
+          const parts = String(media).split('/');
+          fileName = decodeURIComponent(parts[parts.length - 1] || fileName);
+          const response = await axios.get(media, { responseType: 'arraybuffer' });
+          mimeType = response.headers['content-type'] || 'application/octet-stream';
+        } catch {
+          // se não conseguir, segue adiante sem mime confiável
+        }
       }
+    }
 
-      let type = 'document';
+    // Classifica tipo para Evolution
+    let type: 'image' | 'video' | 'audio' | 'document' = 'document';
+    const family = (mimeType || '').split('/')[0];
+    if (family === 'image') type = 'image';
+    else if (family === 'video') type = 'video';
+    else if (family === 'audio') type = 'audio';
 
-      switch (mimeType.split('/')[0]) {
-        case 'image':
-          type = 'image';
-          break;
-        case 'video':
-          type = 'video';
-          break;
-        case 'audio':
-          type = 'audio';
-          break;
-        default:
-          type = 'document';
-          break;
-      }
+    // Força alguns formatos "imagem" a irem como documento (como já fazia)
+    const documentExtensions = ['.gif', '.svg', '.tiff', '.tif'];
+    if (type === 'image' && parsedMedia && documentExtensions.includes(parsedMedia?.ext)) {
+      type = 'document';
+    }
 
-      if (type === 'audio') {
-        const data: SendAudioDto = {
-          number: number,
-          audio: media,
-          delay: 1200,
-          quoted: options?.quoted,
-        };
-
-        sendTelemetry('/message/sendWhatsAppAudio');
-
-        const messageSent = await waInstance?.audioWhatsapp(data, null, true);
-
-        return messageSent;
-      }
-
-      const documentExtensions = ['.gif', '.svg', '.tiff', '.tif'];
-      if (type === 'image' && parsedMedia && documentExtensions.includes(parsedMedia?.ext)) {
-        type = 'document';
-      }
-
-      const data: SendMediaDto = {
-        number: number,
-        mediatype: type as any,
-        fileName: fileName,
-        media: media,
+    // Áudio usa sua rota dedicada; se baixou, envia base64. Senão, URL (comportamento antigo).
+    if (type === 'audio') {
+      const data: SendAudioDto = {
+        number,
+        audio: downloaded
+          ? `data:${mimeType || 'audio/mpeg'};base64,${downloaded.buffer.toString('base64')}`
+          : media,
         delay: 1200,
         quoted: options?.quoted,
       };
 
-      sendTelemetry('/message/sendMedia');
-
-      if (caption) {
-        data.caption = caption;
-      }
-
-      const messageSent = await waInstance?.mediaMessage(data, null, true);
-
+      sendTelemetry('/message/sendWhatsAppAudio');
+      const messageSent = await waInstance?.audioWhatsapp(data, null, true);
       return messageSent;
-    } catch (error) {
-      this.logger.error(error);
     }
+
+    // Demais tipos (imagem, vídeo, documento): envia base64 se baixou, senão URL
+    const data: SendMediaDto = {
+      number,
+      mediatype: type as any,
+      fileName: fileName || `file-${Date.now()}`,
+      media: downloaded
+        ? `data:${mimeType || 'application/octet-stream'};base64,${downloaded.buffer.toString('base64')}`
+        : media,
+      delay: 1200,
+      quoted: options?.quoted,
+    };
+
+    if (caption) data.caption = caption;
+
+    sendTelemetry('/message/sendMedia');
+    const messageSent = await waInstance?.mediaMessage(data, null, true);
+    return messageSent;
+  } catch (error) {
+    this.logger.error(error);
   }
+}
+
 
   public async onSendMessageError(instance: InstanceDto, conversation: number, error?: any) {
     this.logger.verbose(`onSendMessageError ${JSON.stringify(error)}`);
